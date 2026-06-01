@@ -60,14 +60,6 @@ conda run -n query python disk_monitor.py
 | 暂停监控 | 临时停止采集 |
 | 退出 | 关闭程序 |
 
-## 打包为 EXE
-
-`ash
-# 使用 PyInstaller 打包为单文件 exe
-pyinstaller ssd_monitor.spec
-
-# 生成的文件在 dist/SSDMonitor.exe
-`
 
 ## 文件结构
 
@@ -78,7 +70,6 @@ pyinstaller ssd_monitor.spec
 ├── config_manager.py     # 配置管理：config.json 读写与状态持久化
 ├── auto_start.py         # 开机自启：Windows 注册表操作
 ├── 启动.vbs              # VBS 启动脚本：无窗口启动 pythonw
-├── ssd_monitor.spec      # PyInstaller 打包配置
 ├── requirements.txt      # Python 依赖
 └── data/                 # 运行时数据目录（自动生成）
     ├── config.json       # 配置与运行状态
@@ -110,3 +101,5 @@ openpyxl  # xlsx 读写（隐式依赖）
 ## License
 
 MIT
+
+
