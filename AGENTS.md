@@ -1,59 +1,41 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 ## 项目概述
 
-Windows 桌面 SSD 写入量监控工具。后台常驻系统托盘，定时通过 smartctl 读取 SMART 数据（主机写入量），记录到 xlsx 文件，支持每日统计、趋势分析和开机自启。
+Windows 多 SSD 写入监控，常驻系统托盘。当前版本 2.1.0，日常启动入口为根目录 SSDMonitor.exe，开发入口为 disk_monitor.py。
 
-## 技术栈
+## 开发环境与命令
 
-- Python 3.x（conda 环境 query）
-- pystray + Pillow（托盘 UI）
-- openpyxl（xlsx 读写）
-- smartmontools（外部依赖，smartctl.exe 需在 PATH 或项目目录）
-- PyInstaller（打包为单 exe）
+Windows 11，PowerShell 7，Python 使用 conda query 环境。依赖包括 pystray、Pillow、psutil、openpyxl；构建依赖 PyInstaller。源码运行需要 smartctl，便携 exe 已内置。
 
-## 常用命令
-
-`ash
-# 开发运行
+```powershell
 conda run -n query python disk_monitor.py
-
-# 无窗口运行
 conda run -n query pythonw disk_monitor.py
+conda run -n query python -m unittest discover -s tests -v
+./build.ps1
+```
 
-# 打包
-conda run -n query pyinstaller ssd_monitor.spec
-`
+## 模块
 
-## 文件结构
+- disk_monitor.py：Tk 管理窗口、托盘、调度和单实例锁。
+- tray_popup.py：按硬盘分列的悬停浮窗，每列依次显示今日、近七天、健康度、总写入。
+- monitor_service.py：每盘状态、统计、待写队列、历史缓存、故障隔离。
+- weekly_stats.py：七个自然日的已确认写入求和与去重。
+- smart_reader.py：smartctl JSON、设备身份、健康度与盘符映射。
+- csv_logger.py：多盘 xlsx 批量导出、去重、历史读取。
+- config_manager.py：原子配置写入与旧版数据迁移。
+- auto_start.py：Windows HKCU Run 开机自启。
+- process_io_tracker.py：整机进程 I/O 参考。
+- diagnostics.py：使用临时数据目录的源码与 exe 自检。
 
-`
-disk_monitor.py    主程序入口 — 托盘 UI + 监控循环 + 状态管理
-smart_reader.py    SMART 数据读取 — 封装 smartctl 调用，解析 NVMe/SATA 输出
-csv_logger.py      xlsx 日志写入 — write_log.xlsx / daily_summary.xlsx / trend_summary.xlsx
-config_manager.py  配置管理 — config.json 读写，运行状态持久化到 _state 字段
-auto_start.py      开机自启 — Windows 注册表 HKCU\...\Run
-启动.vbs           VBS 启动脚本 — 无窗口启动 pythonw
-data/              数据目录 — config.json + xlsx 日志文件
-`
+## 关键约定
 
-## 核心流程
-
-1. disk_monitor.main() → 加载配置、启动监控线程、创建托盘图标
-2. monitor_loop() 每 N 秒调用 collect_once()
-3. collect_once() → smart_reader.read_smart() 获取累计字节数 → 计算增量 → 调用 csv_logger 写入三种日志
-4. 日期变更检测：跨日时用 _state 中的 last_total_bytes 补生成前一天的 daily_summary
-
-## 关键设计决策
-
-- **状态持久化**：运行状态存储在 config.json 的 _state 字段，每次采集后立即写盘，断电/崩溃不丢数据
-- **进程互斥**：通过 data/ssd_monitor.lock 文件 + PID 检测实现单实例运行
-- **日志格式**：使用 xlsx (openpyxl) 而非 CSV，支持中文列名和自动列宽
-- **SMART 解析**：NVMe 用 Data Units Written（每 unit = 512,000 bytes），SATA 用 F1 属性（32MiB 单位）
-
-## 注意事项
-
-- 所有 subprocess 调用需隐藏窗口：STARTUPINFO + STARTF_USESHOWWINDOW + creationflags=0x08000000
-- _state 通过 config_manager.save_state() 保存，会同时更新内存 config 和磁盘文件
-- 设计文档在 docs/superpowers/specs/2026-05-31-ssd-write-monitor-design.md
-- requirements.txt 只列了 pystray 和 Pillow，openpyxl 是隐式依赖
+- 所有 subprocess 调用需隐藏窗口：STARTUPINFO + STARTF_USESHOWWINDOW + creationflags=0x08000000。
+- Tk 界面只能在主线程操作，硬盘采集和工作簿读取在后台执行；悬停仅使用缓存快照。
+- 配置、每盘状态和待写队列一次原子保存，保存成功后才更新内存基线。
+- 每盘使用稳定身份；跨日未知区间写入保留为未分配量，不强行计入某一天。
+- 近七天含今天，仅累加已确认写入，合并每日汇总、待写队列和当前状态；按日期与硬盘去重。
+- NVMe Data Units Written 每单位为 512,000 字节；SATA 仅接受明确标注单位的属性。
+- 根目录 SSDMonitor.exe 与 data 相邻；当前日志在 data/v2，配置仍会引用 data/backups 中的升级备份。
+- 旧版归档统一放 old_versions，已被 Git 忽略；目录说明见 docs/project-layout.md。
+- tests 使用临时目录、模拟硬盘和注入的历史读取器，避免修改真实监控数据。

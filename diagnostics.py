@@ -8,10 +8,9 @@ import threading
 import tkinter as tk
 
 from config_manager import DEFAULT_CONFIG, _atomic_write_text
-from csv_logger import flush_batches
+from csv_logger import flush_batches, get_recent_daily
 from monitor_service import MonitorService
 from smart_reader import find_smartctl
-from tray_text import build_tooltip
 
 
 def run_self_test(report_path):
@@ -21,7 +20,6 @@ def run_self_test(report_path):
     tray_thread = None
     try:
         from disk_monitor import MonitorApp, create_icon_image
-        import pystray
         with tempfile.TemporaryDirectory(prefix="ssd-monitor-selftest-") as folder:
             base = Path(folder)
             cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -30,6 +28,7 @@ def run_self_test(report_path):
                 _atomic_write_text(str(base / "config.json"), json.dumps(updated))
             service = MonitorService(
                 cfg, saver=save, exporter=lambda batches: flush_batches(batches, base / "logs"),
+                history_reader=lambda today: get_recent_daily(today, base / "logs"),
             )
             service.collect()
             snapshot = service.snapshot()
@@ -44,16 +43,23 @@ def run_self_test(report_path):
             app.refresh()
             root.update_idletasks()
             report["ui_rows"] = len(app.table.get_children())
+            from ctypes import wintypes
+            from tray_popup import HoverIcon, LABELS
+            app.popup.render(wintypes.RECT(0, 0, 1920, 1080))
+            report["popup_columns"] = len(app.popup.value_labels)
+            report["popup_fields"] = list(LABELS)
+            report["popup_values"] = [[label.cget("text") for label in column]
+                                      for column in app.popup.value_labels]
             ready = threading.Event()
-            icon = pystray.Icon("SSDMonitorSelfTest", create_icon_image(),
-                                build_tooltip(snapshot), app.build_menu(snapshot))
+            icon = HoverIcon("SSDMonitorSelfTest", create_icon_image(),
+                             "", app.build_menu(snapshot))
             # 建立真实 Windows 托盘后端但不显示图标，不干扰现有监控。
             tray_thread = threading.Thread(target=lambda: icon.run(setup=lambda _: ready.set()), daemon=True)
             tray_thread.start()
             if not ready.wait(10):
                 raise RuntimeError("托盘后端未能初始化")
             report.update(
-                ok=True, smartctl=find_smartctl(), tooltip=build_tooltip(snapshot),
+                ok=True, smartctl=find_smartctl(),
                 workbooks=sorted(path.name for path in (base / "logs").glob("*.xlsx")),
                 disks=[{key: disk.get(key) for key in (
                     "model", "protocol", "volumes", "health_percent", "temperature", "supported",

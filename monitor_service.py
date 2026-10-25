@@ -9,7 +9,8 @@ import uuid
 from config_manager import save_state
 from smart_reader import scan_disks, read_smart, volume_map, physical_disk_number
 from process_io_tracker import snapshot as io_snapshot, compute_delta
-from csv_logger import flush_batches
+from csv_logger import flush_batches, get_recent_daily
+from weekly_stats import weekly_totals
 
 LOG = logging.getLogger(__name__)
 
@@ -65,7 +66,8 @@ def advance_state(previous, total_bytes, now):
 
 class MonitorService:
     def __init__(self, config, scanner=scan_disks, reader=read_smart, volumes=volume_map,
-                 exporter=flush_batches, saver=save_state, clock=datetime.now):
+                 exporter=flush_batches, saver=save_state, clock=datetime.now,
+                 history_reader=get_recent_daily):
         self.config = copy.deepcopy(config)
         for disk in self.config["disks"].values():
             disk.update(status="pending", online=False)
@@ -78,6 +80,10 @@ class MonitorService:
         self.error = ""
         self.export_error = ""
         self.collecting = False
+        self.history_reader = history_reader
+        self.history_rows = []
+        self.history_ready = False
+        self.history_error = ""
 
     def _commit(self, updated):
         self.saver(updated, updated["_state"])
@@ -111,7 +117,10 @@ class MonitorService:
     def snapshot(self):
         with self.lock:
             cfg = copy.deepcopy(self.config)
-            day = self.clock().date().isoformat()
+            today = self.clock().date()
+            day = today.isoformat()
+            weeks = weekly_totals(self.history_rows, cfg["_state"]["pending_batches"],
+                                  cfg["_state"]["disks"], today)
             rows = []
             for disk_id, disk in cfg["disks"].items():
                 state = cfg["_state"]["disks"].get(disk_id, {})
@@ -119,6 +128,8 @@ class MonitorService:
                     disk, disk_id=disk_id, state=state,
                     today_bytes=state.get("today_bytes", 0) if state.get("last_date") == day else 0,
                     today_unallocated=state.get("unallocated_bytes", 0) if state.get("last_date") == day else 0,
+                    week_bytes=weeks.get(disk_id, {}).get("bytes", 0) if self.history_ready else None,
+                    week_days=weeks.get(disk_id, {}).get("days", 0),
                 ))
             return {
                 "disks": rows, "interval_minutes": cfg["interval_minutes"],
@@ -126,8 +137,22 @@ class MonitorService:
                 "pending": len(cfg["_state"]["pending_batches"]),
                 "legacy": cfg.get("legacy"), "recovery_notice": cfg.get("recovery_notice", ""),
                 "error": self.error, "export_error": self.export_error,
+                "history_error": self.history_error,
                 "collecting": self.collecting, "process_sources": copy.deepcopy(self.process_sources),
             }
+
+    def refresh_history(self):
+        try:
+            rows = self.history_reader(self.clock().date())
+            with self.lock:
+                self.history_rows = rows
+                self.history_ready = True
+                self.history_error = ""
+        except Exception as exc:
+            with self.lock:
+                self.history_ready = False
+                self.history_error = "近七天记录暂时无法读取"
+            LOG.warning("读取七日汇总失败：%s", exc)
 
     def flush_pending(self):
         with self.lock:
@@ -162,6 +187,7 @@ class MonitorService:
                 # 扫描失败时仍尝试补写上一轮日志。
                 self.flush_pending()
             finally:
+                self.refresh_history()
                 self.collecting = False
 
     def _collect(self):

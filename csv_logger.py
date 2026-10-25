@@ -217,6 +217,25 @@ def flush_batches(batches, directory=None):
             _upsert(root / f"process_activity-{month}.xlsx", PROCESS_COLUMNS, rows, ("record_id",))
 
 
+def get_recent_daily(today, directory=None):
+    """读取含今天在内的七天日汇总；只在后台调用，不修改工作簿。"""
+    root = Path(directory) if directory is not None else EXPORT_DIR
+    path = root / "daily_summary.xlsx"
+    with EXPORT_LOCK:
+        if not path.exists():
+            return []
+        book = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = book.active
+            if [cell.value for cell in sheet[1]] != [label for _, label in DAILY_COLUMNS]:
+                raise ValueError("日汇总表头不匹配")
+            cutoff, end = (today - timedelta(days=6)).isoformat(), today.isoformat()
+            return [row for row in _records(sheet, DAILY_COLUMNS)
+                    if cutoff <= row["date"] <= end]
+        finally:
+            book.close()
+
+
 def get_recent_trend(disk_id=None, days=30, directory=None):
     root = Path(directory) if directory is not None else EXPORT_DIR
     path = root / "trend_summary.xlsx"

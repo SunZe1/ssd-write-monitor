@@ -164,6 +164,7 @@ class ServiceTests(PatchedTestCase):
             reader=self.reader, volumes=lambda: {0: ["C:", "D:"], 1: ["E:"]},
             saver=self.save, exporter=lambda batches: csv_logger.flush_batches(batches, self.root / "v2"),
             clock=lambda: self.at,
+            history_reader=lambda today: csv_logger.get_recent_daily(today, self.root / "v2"),
         )
 
     def advance(self, minutes=10):
@@ -193,6 +194,30 @@ class ServiceTests(PatchedTestCase):
         self.assertEqual(self.states()[new_id]["today_bytes"], 0)
         rows = self.read_book("trend_summary.xlsx", csv_logger.TREND_COLUMNS)
         self.assertEqual(len(rows), 3)
+
+    def test_week_total_includes_pending_data_and_survives_restart_without_duplicates(self):
+        self.service.collect()
+        self.advance()
+        self.devices["/dev/sda"] = nvme(units=120)
+        with patch.object(self.service, "exporter", side_effect=PermissionError("locked")):
+            self.service.collect()
+        disk_id = smart_reader.parse_smart(nvme(), "/dev/sda", "nvme")["disk_id"]
+        def weekly():
+            return next(row for row in self.service.snapshot()["disks"] if row["disk_id"] == disk_id)
+        self.assertEqual(weekly()["week_bytes"], 20 * 512000)
+        self.service = self.make_service(self.saved)
+        self.service.flush_pending()
+        self.service.refresh_history()
+        self.assertEqual(weekly()["week_bytes"], 20 * 512000)
+        self.at += timedelta(days=1)
+        self.devices["/dev/sda"] = nvme(units=130)
+        self.service.collect()
+        self.assertEqual(weekly()["week_bytes"], 20 * 512000)
+        self.advance()
+        self.devices["/dev/sda"] = nvme(units=140)
+        self.service.collect()
+        self.assertEqual(weekly()["week_bytes"], 30 * 512000)
+        self.assertEqual(weekly()["week_days"], 2)
 
     def test_path_move_retains_alias_and_same_day_count(self):
         self.service.collect()
@@ -449,42 +474,7 @@ class ConfigTests(PatchedTestCase):
         self.assertEqual(self.path.read_text(), original)
 
 
-class TooltipHealthTests(unittest.TestCase):
-    def disk(self, name="系统盘", **changes):
-        item = dict(alias=name, enabled=True, status="ok", today_bytes=3 * 1024**3,
-                    health_percent=99, temperature=46, critical_warning=0,
-                    state={"last_total_bytes": 30 * 1024**4})
-        item.update(changes)
-        return item
-
-    def test_both_disks_have_individual_values(self):
-        from tray_text import build_tooltip, utf16_length
-        text = build_tooltip({"disks": [self.disk(), self.disk("游戏盘", health_percent=100)]})
-        blocks = text.split("\n\n")
-        self.assertEqual(len(blocks), 3)
-        for block, name, health in zip(blocks[1:], ("系统盘", "游戏盘"), (99, 100)):
-            lines = block.splitlines()
-            self.assertEqual(lines[0], name)
-            self.assertIn("今日：3.00GiB", lines)
-            self.assertIn("累计：30.00TiB", lines)
-            self.assertIn(f"健康：{health}%", lines)
-            self.assertIn("温度：46℃", lines)
-        self.assertLessEqual(utf16_length(text), 127)
-
-    def test_many_disks_and_surrogate_pairs_stay_in_windows_limit(self):
-        from tray_text import build_tooltip, utf16_length
-        disks = [self.disk("游戏🎮盘" * 8 + str(n)) for n in range(12)]
-        text = build_tooltip({"disks": disks, "pending": 100, "error": "failure"})
-        self.assertLessEqual(utf16_length(text), 127)
-        self.assertIn("双击查看", text)
-
-    def test_offline_does_not_advertise_stale_temperature_and_health(self):
-        from tray_text import build_tooltip
-        text = build_tooltip({"disks": [self.disk(status="offline")]})
-        self.assertIn("离线", text)
-        self.assertNotIn("46℃", text)
-        self.assertNotIn("健康：99%", text)
-
+class HealthUITests(unittest.TestCase):
     def test_nvme_health_estimate_and_warnings(self):
         for used, expected in ((0, 100), (1, 99), (100, 0), (150, 0), (None, None)):
             data = nvme()

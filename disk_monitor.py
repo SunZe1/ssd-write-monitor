@@ -20,7 +20,7 @@ from auto_start import is_auto_start_enabled, set_auto_start
 from config_manager import load_config, DATA_DIR, ensure_dirs
 from csv_logger import get_recent_trend
 from monitor_service import MonitorService
-from tray_text import build_tooltip
+from tray_popup import HoverIcon, TrayPopup
 
 LOG = logging.getLogger(__name__)
 GIB = 1024 ** 3
@@ -111,6 +111,7 @@ class MonitorApp:
         self.root.minsize(900, 460)
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
         self._build_window()
+        self.popup = TrayPopup(self.root, self.show_window)
         self.root.withdraw()
 
     def _build_window(self):
@@ -179,6 +180,7 @@ class MonitorApp:
         self.notice.configure(text="已请求采集和扫描，正在处理…")
 
     def show_window(self):
+        self.popup.hide()
         self.refresh()
         self.root.deiconify()
         self.root.lift()
@@ -340,8 +342,8 @@ class MonitorApp:
             "；".join(f"{row['name']} {row['delta_bytes'] / GIB:.3f} GiB" for row in sources)
             if sources else "暂无区间数据"
         ))
-        if self.icon:
-            self.icon.title = build_tooltip(snapshot, self.paused.is_set())
+        self.popup.update(snapshot, self.paused.is_set())
+        if self.icon and not self.icon.menu_open:
             signature = tuple((disk["disk_id"], disk["alias"], disk["enabled"], disk.get("supported")) for disk in snapshot["disks"])
             if signature != self.menu_signature:
                 self.icon.menu = self.build_menu(snapshot)
@@ -398,6 +400,7 @@ class MonitorApp:
                 next_retry = time.monotonic() + 30
             elif now >= next_retry:
                 self.service.flush_pending()
+                self.service.refresh_history()
                 next_retry = time.monotonic() + 30
             self.request_event.wait(timeout=1)
 
@@ -420,12 +423,13 @@ class MonitorApp:
             self.root.after(3000, self._refresh_loop)
 
     def start(self):
-        self.icon = pystray.Icon("SSDMonitor", create_icon_image(), "SSD 写入监控",
-                                 self.build_menu(self.service.snapshot()))
+        self.icon = HoverIcon("SSDMonitor", create_icon_image(), "",
+                              self.build_menu(self.service.snapshot()))
         # Windows 托盘消息循环与 Tk 主线程分离；所有 GUI 操作通过队列回主线程。
         threading.Thread(target=self.icon.run, daemon=True, name="tray").start()
         self.worker = threading.Thread(target=self._worker_loop, name="ssd-collector")
         self.worker.start()
+        self.popup.start(self.icon)
         self._pump()
         self._refresh_loop()
 
@@ -433,6 +437,7 @@ class MonitorApp:
         self.closing = True
         self.stop_event.set()
         self.request_event.set()
+        self.popup.close()
         self.summary.configure(text="正在完成当前采集并退出…")
         if self.icon:
             self.icon.stop()
