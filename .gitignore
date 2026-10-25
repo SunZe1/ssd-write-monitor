@@ -9,8 +9,21 @@ build/
 # Data & logs
 data/
 
-# IDE / tool
+# Local AI assistant instructions & settings
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.agents/
+.codex/
 .claude/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+.github/instructions/
+
+# IDE
 .vscode/
 .idea/
 
