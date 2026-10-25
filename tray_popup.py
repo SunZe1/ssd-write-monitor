@@ -26,6 +26,8 @@ SHELL = ctypes.WinDLL("shell32", use_last_error=True)
 SHELL.Shell_NotifyIconGetRect.argtypes = [ctypes.POINTER(IconIdentifier), ctypes.POINTER(wintypes.RECT)]
 SHELL.Shell_NotifyIconGetRect.restype = ctypes.c_long
 USER.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+USER.GetAsyncKeyState.argtypes = [ctypes.c_int]
+USER.GetAsyncKeyState.restype = wintypes.SHORT
 USER.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
 USER.MonitorFromRect.restype = wintypes.HANDLE
 USER.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
@@ -53,6 +55,14 @@ def icon_rect(icon):
 
 def contains(rect, x, y):
     return bool(rect and rect.left <= x < rect.right and rect.top <= y < rect.bottom)
+
+
+def mouse_button_down():
+    """Return whether a mouse button is currently held by the user."""
+    try:
+        return any(USER.GetAsyncKeyState(vk) & 0x8000 for vk in (0x01, 0x02))
+    except (AttributeError, OSError):
+        return False
 
 
 def work_area(rect):
@@ -92,20 +102,39 @@ def disk_values(disk):
 
 class HoverIcon(pystray.Icon):
     """在系统菜单打开时抑制悬停卡片，保留 pystray 的点击行为。"""
-    menu_open = False
-    suppress_until = 0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # These must be per-icon.  Class attributes let a stopped diagnostic
+        # icon leak its menu state into the next icon instance.
+        self.menu_open = False
+        self.suppress_until = 0.0
+        self.hover_blocked = False
 
     def _on_notify(self, wparam, lparam):
-        if lparam in (0x201, 0x202, 0x204, 0x205):
-            self.suppress_until = time.monotonic() + 0.8
-        if lparam != 0x205:
+        # Windows sends the right-button-down notification before the
+        # right-button-up notification that pystray uses to enter its blocking
+        # TrackPopupMenuEx call.  Start suppressing the hover card on button
+        # down, otherwise it can appear while the user is opening a submenu.
+        right_button_down = lparam == 0x0204
+        right_button_up = lparam == 0x0205
+        if right_button_down:
+            self.menu_open = True
+            self.hover_blocked = True
+            self.suppress_until = max(self.suppress_until, time.monotonic() + 0.8)
             return super()._on_notify(wparam, lparam)
+        if not right_button_up:
+            if lparam in (0x0201, 0x0202):
+                self.hover_blocked = True
+                self.suppress_until = max(self.suppress_until, time.monotonic() + 0.8)
+            return super()._on_notify(wparam, lparam)
+
         self.menu_open = True
+        self.hover_blocked = True
         try:
             return super()._on_notify(wparam, lparam)
         finally:
-            if self.menu_open:
-                self.suppress_until = time.monotonic() + 0.8
+            self.suppress_until = max(self.suppress_until, time.monotonic() + 0.8)
             self.menu_open = False
 
 
@@ -145,6 +174,7 @@ class TrayPopup:
         self.hover_since = None
         self.leave_since = None
         self.anchor = None
+        self.last_icon_rect = None
         self.signature = None
         self.value_labels = []
         self.window.update_idletasks()
@@ -155,7 +185,12 @@ class TrayPopup:
     def update(self, snapshot, paused=False):
         self.snapshot, self.paused = snapshot, paused
         if self.visible:
-            self.show(self.anchor)
+            if (self.icon and (self.icon.menu_open or
+                               getattr(self.icon, "hover_blocked", False) is True or
+                               time.monotonic() < self.icon.suppress_until)):
+                self.hide()
+            else:
+                self.show(self.anchor)
 
     def render(self, work):
         disks = [disk for disk in self.snapshot["disks"] if disk.get("enabled")]
@@ -239,13 +274,25 @@ class TrayPopup:
         self.timer = None
         now = time.monotonic()
         rect = icon_rect(self.icon)
+        if rect:
+            self.last_icon_rect = rect
+        elif self.visible and self.last_icon_rect:
+            # Explorer can briefly fail Shell_NotifyIconGetRect while it is
+            # repainting the notification area. Keep the last anchor for this
+            # polling cycle instead of treating that transient failure as a
+            # mouse leave.
+            rect = self.last_icon_rect
         point = wintypes.POINT()
         USER.GetCursorPos(ctypes.byref(point))
         popup = wintypes.RECT()
         if self.visible:
             USER.GetWindowRect(self.hwnd, ctypes.byref(popup))
-        if self.icon.menu_open or now < self.icon.suppress_until:
+        if self.icon.menu_open or mouse_button_down() or now < self.icon.suppress_until:
             self.hide()
+        elif getattr(self.icon, "hover_blocked", False) is True:
+            self.hide()
+            if not contains(rect, point.x, point.y):
+                self.icon.hover_blocked = False
         elif contains(rect, point.x, point.y):
             self.leave_since = None
             if self.hover_since is None:

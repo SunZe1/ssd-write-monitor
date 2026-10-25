@@ -128,6 +128,62 @@ class PopupTests(unittest.TestCase):
             self.popup._poll()
             self.assertGreaterEqual(hiding.call_count, 2)
 
+    def test_right_click_suppresses_popup_before_submenu_opens(self):
+        with patch("tray_popup.pystray.Icon.__init__", return_value=None):
+            icon = HoverIcon("test", None, "", None)
+        icon._running = False
+        icon._icon_handle = None
+        with patch("tray_popup.pystray.Icon._on_notify", return_value=None), \
+                patch("tray_popup.time.monotonic", side_effect=[10.0, 10.2]):
+            icon._on_notify(0, 0x0204)
+            self.assertTrue(icon.menu_open)
+            icon._on_notify(0, 0x0205)
+        self.assertFalse(icon.menu_open)
+        self.assertGreaterEqual(icon.suppress_until, 11.0)
+
+    def test_held_mouse_button_cannot_flash_popup_during_menu_race(self):
+        self.popup.icon = Mock(menu_open=False, suppress_until=0)
+        with patch("tray_popup.icon_rect", return_value=wintypes.RECT(10, 10, 30, 30)), \
+                patch("tray_popup.USER.GetCursorPos"), \
+                patch("tray_popup.mouse_button_down", return_value=True), \
+                patch("tray_popup.time.monotonic", return_value=1.0), \
+                patch.object(self.root, "after", return_value=None), \
+                patch.object(self.popup, "show") as showing:
+            self.popup._poll()
+        showing.assert_not_called()
+        self.assertFalse(self.popup.visible)
+
+    def test_stale_icon_rect_cannot_start_popup_when_icon_is_not_visible(self):
+        self.popup.icon = Mock(menu_open=False, suppress_until=0, visible=False)
+        self.popup.last_icon_rect = wintypes.RECT(10, 10, 30, 30)
+        pointer = wintypes.POINT(15, 15)
+        with patch("tray_popup.icon_rect", return_value=None), \
+                patch("tray_popup.USER.GetCursorPos", side_effect=lambda target: setattr(target._obj, "x", pointer.x) or setattr(target._obj, "y", pointer.y)), \
+                patch("tray_popup.mouse_button_down", return_value=False), \
+                patch("tray_popup.time.monotonic", return_value=1.0), \
+                patch.object(self.root, "after", return_value=None), \
+                patch.object(self.popup, "show") as showing:
+            self.popup._poll()
+        showing.assert_not_called()
+
+    def test_menu_close_blocks_rehover_until_pointer_leaves_icon(self):
+        self.popup.icon = Mock(menu_open=False, suppress_until=0, hover_blocked=True)
+        pointer = [15, 15]
+        def cursor(target):
+            target._obj.x, target._obj.y = pointer
+            return True
+        with patch("tray_popup.icon_rect", return_value=wintypes.RECT(10, 10, 30, 30)), \
+                patch("tray_popup.USER.GetCursorPos", side_effect=cursor), \
+                patch("tray_popup.mouse_button_down", return_value=False), \
+                patch("tray_popup.time.monotonic", return_value=1.0), \
+                patch.object(self.root, "after", return_value=None), \
+                patch.object(self.popup, "show") as showing:
+            self.popup._poll()
+            showing.assert_not_called()
+            pointer[:] = [-5000, -5000]
+            self.popup._poll()
+        self.assertFalse(self.popup.icon.hover_blocked)
+
 
 if __name__ == "__main__":
     unittest.main()
