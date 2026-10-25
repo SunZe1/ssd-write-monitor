@@ -1,235 +1,234 @@
-﻿import os
-from datetime import datetime, date
+"""批量写入多盘 xlsx；持久化待写队列由 MonitorService 管理。"""
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+import logging
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import threading
+import time
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
 from config_manager import DATA_DIR
 
-import time
+LOG = logging.getLogger(__name__)
+EXPORT_DIR = Path(DATA_DIR) / "v2"
+EXPORT_LOCK = threading.RLock()
+GIB = 1024 ** 3
+TIB = 1024 ** 4
+
+SAMPLE_COLUMNS = [
+    ("record_id", "记录ID"), ("timestamp", "采样时间"), ("disk_id", "硬盘ID"),
+    ("name", "硬盘名称"), ("model", "型号"), ("serial", "序列号"), ("device", "设备路径"),
+    ("total_gib", "累计写入GiB"), ("delta_gib", "区间增量GiB"),
+    ("today_gib", "今日已确认GiB"), ("unallocated_gib", "区间未分配GiB"),
+    ("temperature", "温度℃"), ("interval_start", "区间开始"), ("note", "说明"),
+    ("total_bytes", "累计写入字节"), ("delta_bytes", "区间增量字节"),
+    ("health_percent", "健康度估计%"), ("percentage_used", "寿命已用%"),
+    ("health_warning", "设备健康告警"),
+]
+DAILY_COLUMNS = [
+    ("date", "日期"), ("disk_id", "硬盘ID"), ("name", "硬盘名称"),
+    ("written_gib", "当日已确认GiB"), ("unallocated_gib", "本日发现未分配GiB"),
+    ("start_tib", "首个基线TiB"), ("end_tib", "末次累计TiB"),
+    ("readings", "采样次数"), ("sampled_at", "更新时刻"), ("note", "统计说明"),
+]
+TREND_COLUMNS = [
+    ("date", "日期"), ("disk_id", "硬盘ID"), ("name", "硬盘名称"),
+    ("written_gib", "当日已确认GiB"), ("avg_7d_gib", "近7日已采样日均GiB"),
+    ("sample_days", "近7日采样天数"), ("unallocated_gib", "本日发现未分配GiB"),
+    ("end_tib", "累计写入TiB"), ("sampled_at", "更新时刻"), ("note", "统计说明"),
+]
+PROCESS_COLUMNS = [
+    ("record_id", "记录ID"), ("timestamp", "采样时间"), ("name", "进程名称"),
+    ("pid", "PID"), ("delta_gib", "进程IO增量GiB"), ("scope", "统计范围"),
+]
 
 
-def _safe_save(wb, filepath, retries=3, delay=2):
-    """安全保存，遇到文件锁定时自动重试"""
-    for i in range(retries):
+def _safe_save(wb, filepath, retries=3, delay=0.15):
+    """原子替换失败时明确抛出异常，让调用者保留待写队列。"""
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries):
+        fd, tmp = tempfile.mkstemp(prefix=".xlsx-", suffix=".xlsx", dir=filepath.parent)
+        os.close(fd)
         try:
-            wb.save(filepath)
-            return True
+            wb.save(tmp)
+            with open(tmp, "rb+") as stream:
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, filepath)
+            return
         except PermissionError:
-            if i < retries - 1:
-                time.sleep(delay)
+            if attempt == retries - 1:
+                raise PermissionError(f"{filepath.name} 无法保存，请关闭占用它的 Excel 窗口")
+            time.sleep(delay)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+def _open_book(path, columns):
+    path = Path(path)
+    if path.exists():
+        try:
+            book = load_workbook(path)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            # 不把读取失败一律当成损坏，也不删除历史文件。
+            backup = path.with_suffix(path.suffix + ".bad")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            raise ValueError(f"{path.name} 无法读取，已保留原文件，请修复或恢复备份") from exc
+        sheet = book.active
+        expected = [label for _, label in columns]
+        if [cell.value for cell in sheet[1]] != expected:
+            book.close()
+            raise ValueError(f"{path.name} 表头不匹配，未覆盖文件")
+    else:
+        book = Workbook()
+        sheet = book.active
+        sheet.append([label for _, label in columns])
+    sheet.freeze_panes = "A2"
+    for index, (key, _) in enumerate(columns, 1):
+        width = 26 if key in ("timestamp", "sampled_at", "interval_start") else 20
+        if key in ("disk_id", "record_id", "note", "scope"):
+            width = 36
+        sheet.column_dimensions[get_column_letter(index)].width = width
+    return book
+
+
+def _assign(sheet, row_number, columns, values):
+    for index, (key, _) in enumerate(columns, 1):
+        value = values.get(key)
+        cell = sheet.cell(row_number, index)
+        cell.value = value
+        # 名称和序列号属于普通文本，避免以 = 开头时变成 Excel 公式。
+        if isinstance(value, str):
+            cell.data_type = "s"
+        elif isinstance(value, float):
+            cell.number_format = "0.0000"
+
+
+def _numbered_records(sheet, columns):
+    keys = [key for key, _ in columns]
+    return [
+        (number, dict(zip(keys, values)))
+        for number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2)
+        if any(value is not None for value in values)
+    ]
+
+
+def _records(sheet, columns):
+    return [record for _, record in _numbered_records(sheet, columns)]
+
+
+def _upsert(path, columns, incoming, keys, update_field=None, transform=None):
+    if not incoming:
+        return
+    book = _open_book(path, columns)
+    try:
+        sheet = book.active
+        existing = _numbered_records(sheet, columns)
+        row_numbers = {tuple(record[key] for key in keys): index for index, record in existing}
+        changed = False
+        for record in incoming:
+            key = tuple(record[field] for field in keys)
+            row = row_numbers.get(key)
+            if row is not None:
+                if not update_field:
+                    continue
+                column = [field for field, _ in columns].index(update_field) + 1
+                saved_at = sheet.cell(row, column).value or ""
+                if saved_at > record[update_field]:
+                    continue
             else:
-                print(f"[警告] 无法保存 {os.path.basename(filepath)}，文件可能被 Excel 占用")
-                return False
-        except Exception as e:
-            print(f"[警告] 保存失败: {e}")
-            return False
-    return False
-
-WRITE_LOG_XLSX = os.path.join(DATA_DIR, "write_log.xlsx")
-DAILY_XLSX = os.path.join(DATA_DIR, "daily_summary.xlsx")
-TREND_XLSX = os.path.join(DATA_DIR, "trend_summary.xlsx")
-
-WRITE_LOG_HEADER = [
-    "时间戳(timestamp)", "磁盘(disk)", "累计写入GB(total_written_gb)", "累计写入TB(total_written_tb)",
-    "本次增量GB(delta_gb)", "今日增量GB(today_gb)", "温度(temperature_c)",
-    "写入进程1(top1_process)", "写入进程2(top2_process)", "写入进程3(top3_process)"
-]
-
-DAILY_HEADER = [
-    "日期(date)", "磁盘(disk)", "写入量GB(written_gb)", "写入量TB(written_tb)",
-    "日初累计TB(day_start_tb)", "日末累计TB(day_end_tb)"
-]
-
-TREND_HEADER = [
-    "日期(date)", "写入量GB(written_gb)", "写入量TB(written_tb)", "累计写入TB(cumulative_tb)",
-    "近7天日均GB(avg_7d_gb)", "采集次数(readings)"
-]
+                row = sheet.max_row + 1
+                row_numbers[key] = row
+            _assign(sheet, row, columns, record)
+            changed = True
+        if changed:
+            if transform:
+                transform(sheet, columns)
+            sheet.auto_filter.ref = sheet.dimensions
+            _safe_save(book, path)
+    finally:
+        book.close()
 
 
-def _auto_width(ws):
-    """自动调整所有列宽"""
-    for col_idx in range(1, ws.max_column + 1):
-        max_len = 0
-        col_letter = get_column_letter(col_idx)
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
-            for cell in row:
-                val = str(cell.value) if cell.value else ""
-                # 中文字符算 2 个宽度
-                width = sum(2 if ord(c) > 127 else 1 for c in val)
-                max_len = max(max_len, width)
-        ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+def _averages(sheet, columns):
+    """日期窗口内有采样的日均；没有记录的日期不伪装成零写入。"""
+    rows = _numbered_records(sheet, columns)
+    by_disk = defaultdict(dict)
+    for _, row in rows:
+        by_disk[row["disk_id"]][date.fromisoformat(row["date"])] = float(row["written_gib"] or 0)
+    for index, row in rows:
+        day = date.fromisoformat(row["date"])
+        window = by_disk[row["disk_id"]]
+        values = [
+            window[candidate] for candidate in (day - timedelta(days=n) for n in range(7))
+            if candidate in window
+        ]
+        row["avg_7d_gib"] = sum(values) / len(values) if values else 0
+        row["sample_days"] = len(values)
+        _assign(sheet, index, columns, row)
 
 
-def _ensure_xlsx(filepath, header):
-    """确保 xlsx 存在且有表头，返回 workbook"""
-    if os.path.exists(filepath):
-        wb = load_workbook(filepath)
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.append(header)
-        ws.freeze_panes = "A2"
-        wb.save(filepath)
-    return wb
+def flush_batches(batches, directory=None):
+    """幂等导出：任一文件失败可重放整批，不重复累计或追加明细。"""
+    root = Path(directory) if directory is not None else EXPORT_DIR
+    with EXPORT_LOCK:
+        root.mkdir(parents=True, exist_ok=True)
+        samples, processes, days = defaultdict(list), defaultdict(list), []
+        for batch in batches:
+            for item in batch["samples"]:
+                row = dict(item)
+                for raw, target in (
+                    ("total_bytes", "total_gib"), ("delta_bytes", "delta_gib"),
+                    ("today_bytes", "today_gib"), ("unallocated_bytes", "unallocated_gib"),
+                ):
+                    row[target] = item[raw] / GIB
+                # Excel 数值只有约 15 位有效精度，原始计数以文本保留。
+                row["total_bytes"], row["delta_bytes"] = str(item["total_bytes"]), str(item["delta_bytes"])
+                month = datetime.fromisoformat(item["timestamp"]).strftime("%Y-%m")
+                samples[month].append(row)
+            for item in batch["days"]:
+                days.append(dict(
+                    item, written_gib=item["written_bytes"] / GIB,
+                    unallocated_gib=item["unallocated_bytes"] / GIB,
+                    start_tib=item["start_bytes"] / TIB, end_tib=item["end_bytes"] / TIB,
+                ))
+            for item in batch.get("processes", []):
+                month = datetime.fromisoformat(item["timestamp"]).strftime("%Y-%m")
+                processes[month].append(dict(
+                    item, delta_gib=item["delta_bytes"] / GIB,
+                    scope="整机进程 I/O 参考，未归属到具体硬盘",
+                ))
+        for month, rows in samples.items():
+            _upsert(root / f"write_log-{month}.xlsx", SAMPLE_COLUMNS, rows, ("record_id",))
+        _upsert(root / "daily_summary.xlsx", DAILY_COLUMNS, days, ("date", "disk_id"), "sampled_at")
+        _upsert(root / "trend_summary.xlsx", TREND_COLUMNS, days, ("date", "disk_id"),
+                "sampled_at", _averages)
+        for month, rows in processes.items():
+            _upsert(root / f"process_activity-{month}.xlsx", PROCESS_COLUMNS, rows, ("record_id",))
 
 
-def _read_all_rows(filepath):
-    """读取所有数据行（不含表头）"""
-    if not os.path.exists(filepath):
+def get_recent_trend(disk_id=None, days=30, directory=None):
+    root = Path(directory) if directory is not None else EXPORT_DIR
+    path = root / "trend_summary.xlsx"
+    if not path.exists():
         return []
-    wb = load_workbook(filepath)
-    ws = wb.active
-    rows = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if any(cell is not None for cell in row):
-            rows.append(list(row))
-    return rows
-
-
-# ─── 对外接口 ───
-def _format_source(s):
-    """格式化单个进程来源: 'chrome.exe(120.5MB)'"""
-    mb = s["delta_bytes"] / (1024 ** 2)
-    if mb >= 1024:
-        return f'{s["name"]}({mb/1024:.1f}GB)'
-    return f'{s["name"]}({mb:.1f}MB)'
-
-
-def log_write(timestamp, disk, total_bytes, delta_bytes, today_bytes, temp, sources=None):
-    """写入详细记录
-
-    Args:
-        sources: 可选，[{"name": str, "pid": int, "delta_bytes": int}, ...] 最多取前3个
-    """
-    wb = _ensure_xlsx(WRITE_LOG_XLSX, WRITE_LOG_HEADER)
-    ws = wb.active
-
-    total_gb = total_bytes / (1024 ** 3)
-    total_tb = total_bytes / (1024 ** 4)
-    delta_gb = delta_bytes / (1024 ** 3)
-    today_gb = today_bytes / (1024 ** 3)
-
-    # 进程来源列（最多3列，从左到右递减）
-    source_cols = ["", "", ""]
-    if sources:
-        for i, s in enumerate(sources[:3]):
-            source_cols[i] = _format_source(s)
-
-    ws.append([
-        timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-        disk,
-        round(total_gb, 2),
-        round(total_tb, 3),
-        round(delta_gb, 2),
-        round(today_gb, 2),
-        temp if temp is not None else "",
-        source_cols[0],
-        source_cols[1],
-        source_cols[2],
-    ])
-
-    _auto_width(ws)
-    _safe_save(wb, WRITE_LOG_XLSX)
-
-
-def log_daily_summary(disk, written_bytes, day_start_bytes, day_end_bytes):
-    """写入每日汇总"""
-    wb = _ensure_xlsx(DAILY_XLSX, DAILY_HEADER)
-    ws = wb.active
-
-    today = date.today().isoformat()
-    written_gb = written_bytes / (1024 ** 3)
-    written_tb = written_bytes / (1024 ** 4)
-    start_tb = day_start_bytes / (1024 ** 4)
-    end_tb = day_end_bytes / (1024 ** 4)
-
-    ws.append([
-        today, disk,
-        round(written_gb, 2), round(written_tb, 3),
-        round(start_tb, 3), round(end_tb, 3)
-    ])
-
-    _auto_width(ws)
-    _safe_save(wb, DAILY_XLSX)
-
-
-def log_trend(written_bytes, cumulative_bytes, readings):
-    """更新趋势统计（同一天更新，跨天追加）"""
-    wb = _ensure_xlsx(TREND_XLSX, TREND_HEADER)
-    ws = wb.active
-
-    today = date.today().isoformat()
-    written_gb = written_bytes / (1024 ** 3)
-    written_tb = written_bytes / (1024 ** 4)
-    cum_tb = cumulative_bytes / (1024 ** 4)
-
-    # 查找今天是否已有记录
-    today_row = None
-    for row_idx in range(2, ws.max_row + 1):
-        if ws.cell(row_idx, 1).value == today:
-            today_row = row_idx
-            break
-
-    # 计算近7天日均
-    recent_gb = [written_gb]
-    for row_idx in range(max(2, ws.max_row - 5), ws.max_row + 1):
-        if today_row and row_idx == today_row:
-            continue
-        val = ws.cell(row_idx, 2).value
-        if val is not None:
-            try:
-                recent_gb.append(float(val))
-            except (ValueError, TypeError):
-                pass
-    avg_7d = sum(recent_gb) / len(recent_gb) if recent_gb else 0
-
-    if today_row:
-        # 更新今天的行
-        ws.cell(today_row, 2, round(written_gb, 2))
-        ws.cell(today_row, 3, round(written_tb, 3))
-        ws.cell(today_row, 4, round(cum_tb, 3))
-        ws.cell(today_row, 5, round(avg_7d, 2))
-        ws.cell(today_row, 6, readings)
-    else:
-        ws.append([
-            today,
-            round(written_gb, 2), round(written_tb, 3),
-            round(cum_tb, 3), round(avg_7d, 2), readings
-        ])
-
-    _auto_width(ws)
-    _safe_save(wb, TREND_XLSX)
-
-
-def get_today_stats():
-    """获取今日统计数据"""
-    if not os.path.exists(TREND_XLSX):
-        return None
-    today = date.today().isoformat()
-    wb = load_workbook(TREND_XLSX)
-    ws = wb.active
-    for row_idx in range(2, ws.max_row + 1):
-        if ws.cell(row_idx, 1).value == today:
-            return {
-                "date": ws.cell(row_idx, 1).value,
-                "written_gb": float(ws.cell(row_idx, 2).value or 0),
-                "written_tb": float(ws.cell(row_idx, 3).value or 0),
-                "cumulative_tb": float(ws.cell(row_idx, 4).value or 0),
-                "avg_7d_gb": float(ws.cell(row_idx, 5).value or 0),
-                "readings": int(ws.cell(row_idx, 6).value or 0),
-            }
-    return None
-
-
-def get_recent_trend(days=7):
-    """获取最近 N 天趋势"""
-    if not os.path.exists(TREND_XLSX):
-        return []
-    wb = load_workbook(TREND_XLSX)
-    ws = wb.active
-    rows = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if any(cell is not None for cell in row):
-            rows.append(list(row))
-    return rows[-days:]
+    with EXPORT_LOCK:
+        book = _open_book(path, TREND_COLUMNS)
+        try:
+            cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+            return [
+                row for row in _records(book.active, TREND_COLUMNS)
+                if row["date"] >= cutoff and (disk_id is None or row["disk_id"] == disk_id)
+            ]
+        finally:
+            book.close()

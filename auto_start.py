@@ -57,10 +57,12 @@ def set_auto_start(enabled):
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE)
         if enabled:
-            script = get_script_path()
-            pythonw = _find_pythonw()
-            # 直接用 pythonw.exe + 完整路径，不依赖 .vbs 文件关联
-            cmd = f'"{pythonw}" "{script}"'
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}"'
+            else:
+                script = get_script_path()
+                pythonw = _find_pythonw()
+                cmd = f'"{pythonw}" "{script}"'
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
         else:
             try:

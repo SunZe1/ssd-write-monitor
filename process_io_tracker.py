@@ -10,12 +10,13 @@ import psutil
 def snapshot():
     """对所有进程做一次 write_bytes 快照，返回 {pid: {"name": str, "write_bytes": int}}"""
     snap = {}
-    for p in psutil.process_iter(["pid", "name"]):
+    for p in psutil.process_iter(["pid", "name", "create_time"]):
         try:
             io = p.io_counters()
             snap[p.info["pid"]] = {
                 "name": p.info["name"],
                 "write_bytes": io.write_bytes,
+                "create_time": p.info["create_time"],
             }
         except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError, OSError):
             # 系统进程或已退出的进程，跳过
@@ -30,7 +31,7 @@ def compute_delta(prev_snap, curr_snap, top_n=5):
     """
     deltas = []
     for pid, info in curr_snap.items():
-        if pid in prev_snap:
+        if pid in prev_snap and info.get("create_time") == prev_snap[pid].get("create_time"):
             prev_bytes = prev_snap[pid]["write_bytes"]
             delta = info["write_bytes"] - prev_bytes
             if delta > 0:

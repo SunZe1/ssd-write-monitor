@@ -1,0 +1,12 @@
+smartmontools / smartctl 7.5
+License: GNU General Public License, version 2 or later.
+COPYING.txt contains the license distributed with the installed smartmontools binary.
+
+The portable release includes the unmodified smartctl.exe installed from smartmontools 7.5.
+Corresponding upstream source is included as smartmontools-7.5-source.tar.gz.
+Source: https://github.com/smartmontools/smartmontools
+Tag: RELEASE_7_5
+Tag commit: f276b249fdc84019403491303479485030ac7c80
+Downloaded archive: https://codeload.github.com/smartmontools/smartmontools/tar.gz/refs/tags/RELEASE_7_5
+
+The application invokes smartctl as a separate subprocess through its JSON command interface.

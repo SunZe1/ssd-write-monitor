@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+/SSDMonitor.exe
 
 # Data & logs
 data/
@@ -15,6 +16,7 @@ data/
 
 # Backup
 *.bak
+/old_versions/
 
 # Lock
 *.lock
