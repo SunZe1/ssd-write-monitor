@@ -21,6 +21,7 @@ from config_manager import load_config, DATA_DIR, ensure_dirs
 from csv_logger import get_recent_trend
 from monitor_service import MonitorService
 from tray_popup import HoverIcon, TrayPopup
+from tray_locator import TRAY_TITLE
 
 LOG = logging.getLogger(__name__)
 GIB = 1024 ** 3
@@ -423,7 +424,7 @@ class MonitorApp:
             self.root.after(3000, self._refresh_loop)
 
     def start(self):
-        self.icon = HoverIcon("SSDMonitor", create_icon_image(), "",
+        self.icon = HoverIcon("SSDMonitor", create_icon_image(), TRAY_TITLE,
                               self.build_menu(self.service.snapshot()))
         # Windows 托盘消息循环与 Tk 主线程分离；所有 GUI 操作通过队列回主线程。
         threading.Thread(target=self.icon.run, daemon=True, name="tray").start()

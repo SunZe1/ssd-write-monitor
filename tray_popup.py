@@ -6,14 +6,10 @@ import tkinter as tk
 from tkinter import ttk
 
 import pystray
+from tray_locator import TrayIconLocator, contains
 
 GIB, TIB = 1024 ** 3, 1024 ** 4
-LABELS = ("今日写入：", "近七天写入：", "健康度：", "总写入：")
-
-
-class IconIdentifier(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
-                ("uID", wintypes.UINT), ("guidItem", ctypes.c_byte * 16)]
+LABELS = ("今日写入：", "近七天写入：", "近七天日均写入：", "健康度：", "总写入：")
 
 
 class MonitorInfo(ctypes.Structure):
@@ -22,9 +18,6 @@ class MonitorInfo(ctypes.Structure):
 
 
 USER = ctypes.WinDLL("user32", use_last_error=True)
-SHELL = ctypes.WinDLL("shell32", use_last_error=True)
-SHELL.Shell_NotifyIconGetRect.argtypes = [ctypes.POINTER(IconIdentifier), ctypes.POINTER(wintypes.RECT)]
-SHELL.Shell_NotifyIconGetRect.restype = ctypes.c_long
 USER.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 USER.GetAsyncKeyState.argtypes = [ctypes.c_int]
 USER.GetAsyncKeyState.restype = wintypes.SHORT
@@ -38,23 +31,6 @@ USER.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
 USER.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                             ctypes.c_int, ctypes.c_int, wintypes.UINT]
 USER.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-
-
-def icon_rect(icon):
-    hwnd = getattr(icon, "_hwnd", None)
-    if not hwnd or not icon.visible:
-        return None
-    # pystray 0.19 的 hID 参数未填入 uID，实际注册 ID 为 0；也兼容填入对象 ID 的后端。
-    for uid in (0, id(icon) & 0xffffffff):
-        identifier = IconIdentifier(cbSize=ctypes.sizeof(IconIdentifier), hWnd=hwnd, uID=uid)
-        rect = wintypes.RECT()
-        if SHELL.Shell_NotifyIconGetRect(ctypes.byref(identifier), ctypes.byref(rect)) == 0:
-            return rect
-    return None
-
-
-def contains(rect, x, y):
-    return bool(rect and rect.left <= x < rect.right and rect.top <= y < rect.bottom)
 
 
 def mouse_button_down():
@@ -95,6 +71,7 @@ def disk_values(disk):
     return (
         f"{disk.get('today_bytes', 0) / GIB:.2f} GiB",
         f"{week / GIB:.2f} GiB" if week is not None else "—",
+        f"{week / 7 / GIB:.2f} GiB" if week is not None else "—",
         health_text,
         f"{total / TIB:.2f} TiB" if total is not None else "—",
     )
@@ -174,7 +151,7 @@ class TrayPopup:
         self.hover_since = None
         self.leave_since = None
         self.anchor = None
-        self.last_icon_rect = None
+        self.locator = TrayIconLocator()
         self.signature = None
         self.value_labels = []
         self.window.update_idletasks()
@@ -223,11 +200,11 @@ class TrayPopup:
             self.value_labels.append(labels)
             coverage = f"近七天已有 {disk.get('week_days', 0)} 天记录" if disk.get("week_bytes") is not None else "近七天记录读取中或暂不可用"
             tk.Label(card, text=coverage, background="white", foreground="#64748b",
-                     font=("Microsoft YaHei UI", 9)).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                     font=("Microsoft YaHei UI", 9)).grid(row=len(LABELS) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         if not disks:
             tk.Label(self.cards, text="未启用可监控硬盘，双击打开管理窗口。",
                      background="#f8fafc", padx=8, pady=20).grid()
-        notes = ["近七天含今天，仅累计已确认写入。双击打开管理。"]
+        notes = ["近七天含今天，日均为已确认写入总量除以 7。双击打开管理。"]
         if self.snapshot.get("history_error"):
             notes.append(self.snapshot["history_error"])
         if self.snapshot.get("error"):
@@ -250,10 +227,12 @@ class TrayPopup:
         work = work_area(anchor)
         self.render(work)
         width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
+        if self.visible and (width, height) == (self.window.winfo_width(), self.window.winfo_height()):
+            return
         x, y = popup_position(anchor, work, width, height)
         self.window.geometry(f"{width}x{height}")
-        # NOACTIVATE 防止鼠标悬停时抢走其他程序的输入焦点。
-        self.window.deiconify()
+        # Map the Tk wrapper without activating it. A separate deiconify can
+        # take focus before SetWindowPos and cause Explorer to dismiss the panel.
         USER.SetWindowPos(self.hwnd, wintypes.HWND(-1), x, y, width, height, 0x10 | 0x40)
         self.visible = True
 
@@ -268,42 +247,38 @@ class TrayPopup:
 
     def start(self, icon):
         self.icon = icon
+        self.locator.start(icon.title)
         self._poll()
 
     def _poll(self):
         self.timer = None
         now = time.monotonic()
-        rect = icon_rect(self.icon)
-        if rect:
-            self.last_icon_rect = rect
-        elif self.visible and self.last_icon_rect:
-            # Explorer can briefly fail Shell_NotifyIconGetRect while it is
-            # repainting the notification area. Keep the last anchor for this
-            # polling cycle instead of treating that transient failure as a
-            # mouse leave.
-            rect = self.last_icon_rect
         point = wintypes.POINT()
-        USER.GetCursorPos(ctypes.byref(point))
+        have_cursor = USER.GetCursorPos(ctypes.byref(point))
+        on_icon = have_cursor and self.icon.visible and self.locator.hit(keep_visible=self.visible)
         popup = wintypes.RECT()
         if self.visible:
             USER.GetWindowRect(self.hwnd, ctypes.byref(popup))
-        if self.icon.menu_open or mouse_button_down() or now < self.icon.suppress_until:
+        if self.visible and USER.GetAsyncKeyState(0x1B) & 0x8000:  # VK_ESCAPE
+            self.icon.hover_blocked = True
+            self.hide()
+        elif self.icon.menu_open or mouse_button_down() or now < self.icon.suppress_until:
             self.hide()
         elif getattr(self.icon, "hover_blocked", False) is True:
             self.hide()
-            if not contains(rect, point.x, point.y):
+            if not on_icon:
                 self.icon.hover_blocked = False
-        elif contains(rect, point.x, point.y):
+        elif on_icon:
             self.leave_since = None
             if self.hover_since is None:
                 self.hover_since = now
             if now - self.hover_since >= 0.3 and not self.visible:
-                self.show(rect)
-        elif self.visible and contains(popup, point.x, point.y):
-            self.leave_since = None
+                self.show(wintypes.RECT(point.x, point.y, point.x + 1, point.y + 1))
         else:
             self.hover_since = None
-            if self.visible:
+            if self.visible and have_cursor and contains(popup, point.x, point.y):
+                self.leave_since = None
+            elif self.visible:
                 if self.leave_since is None:
                     self.leave_since = now
                 elif now - self.leave_since >= 0.25:
@@ -311,6 +286,7 @@ class TrayPopup:
         self.timer = self.root.after(100, self._poll)
 
     def close(self):
+        self.locator.close()
         if self.timer:
             self.root.after_cancel(self.timer)
             self.timer = None

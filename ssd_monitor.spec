@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import shutil
 import sys
+from comtypes.client import GetModule
 
 root = Path(SPECPATH)
 smart_path = os.environ.get("SMARTCTL_PATH") or shutil.which("smartctl")
@@ -29,12 +30,13 @@ database = smart.with_name("drivedb.h")
 if database.is_file():
     datas.append((str(database), "."))
 
+uia_module = GetModule("UIAutomationCore.dll")
 a = Analysis(
     [str(root / "disk_monitor.py")],
     pathex=[str(root)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["pystray._win32"],
+    hiddenimports=["pystray._win32", uia_module.__name__],
     hookspath=[],
     runtime_hooks=[],
     excludes=["numpy", "pandas", "matplotlib", "scipy", "pytest", "IPython", "notebook"],

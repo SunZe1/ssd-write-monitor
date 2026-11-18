@@ -4,7 +4,7 @@ import unittest
 from ctypes import wintypes
 from unittest.mock import Mock, patch
 
-from tray_popup import TrayPopup, HoverIcon, LABELS, disk_values, popup_position, icon_rect
+from tray_popup import TrayPopup, HoverIcon, LABELS, disk_values, popup_position
 from weekly_stats import GIB, weekly_totals
 import config_manager
 from monitor_service import MonitorService
@@ -61,28 +61,22 @@ class PopupTests(unittest.TestCase):
         self.assertEqual([card.grid_info()["column"] for card in cards], [0, 1])
         self.assertEqual([card.grid_info()["row"] for card in cards], [0, 0])
         self.assertGreaterEqual(cards[1].winfo_x(), cards[0].winfo_x() + cards[0].winfo_width())
-        self.assertEqual(LABELS, ("今日写入：", "近七天写入：", "健康度：", "总写入："))
+        self.assertEqual(LABELS, ("今日写入：", "近七天写入：", "近七天日均写入：", "健康度：", "总写入："))
         for column, health in zip(self.popup.value_labels, ("99%", "100%")):
             self.assertEqual([label.cget("text") for label in column],
-                             ["3.00 GiB", "21.00 GiB", health, "30.00 TiB"])
-            self.assertEqual([label.grid_info()["row"] for label in column], [1, 2, 3, 4])
+                             ["3.00 GiB", "21.00 GiB", "3.00 GiB", health, "30.00 TiB"])
+            self.assertEqual([label.grid_info()["row"] for label in column], [1, 2, 3, 4, 5])
+            self.assertEqual(len(column[-1].master.grid_slaves(row=6)), 1)
             for label in column:
                 self.assertGreaterEqual(label.winfo_width(), label.winfo_reqwidth())
 
     def test_offline_and_missing_values_are_explicit(self):
         values = disk_values(disk(status="offline", week_bytes=None, state={}))
-        self.assertEqual(values, ("3.00 GiB", "—", "离线", "—"))
+        self.assertEqual(values, ("3.00 GiB", "—", "—", "离线", "—"))
 
-    def test_icon_lookup_handles_pystray_zero_uid_and_object_uid(self):
-        icon = Mock(_hwnd=123, visible=True)
-        for actual_id in (0, id(icon) & 0xffffffff):
-            def lookup(identifier, rect):
-                if identifier._obj.uID != actual_id:
-                    return -1
-                rect._obj.left, rect._obj.right = 10, 30
-                return 0
-            with patch("tray_popup.SHELL.Shell_NotifyIconGetRect", side_effect=lookup):
-                self.assertEqual(icon_rect(icon).left, 10)
+    def test_average_uses_seven_calendar_days_even_with_partial_records(self):
+        self.assertEqual(disk_values(disk(week_bytes=10 * GIB, week_days=2))[2], "1.43 GiB")
+        self.assertEqual(disk_values(disk(week_bytes=0, week_days=0))[2], "0.00 GiB")
 
     def test_many_disks_wrap_and_scroll_inside_the_work_area(self):
         self.popup.update({"disks": [disk(str(n)) for n in range(18)]})
@@ -103,15 +97,16 @@ class PopupTests(unittest.TestCase):
         self.assertLessEqual(y + 300, work.bottom)
 
     def test_hover_dwell_show_leave_hide_and_context_menu_suppression(self):
-        self.popup.icon = Mock(menu_open=False, suppress_until=0)
+        self.popup.icon = Mock(menu_open=False, suppress_until=0, visible=True)
         pointer = [15, 15]
         def cursor(ptr):
             ptr._obj.x, ptr._obj.y = pointer
             return True
         def show(rect):
             self.popup.visible = True
-        with patch("tray_popup.icon_rect", return_value=wintypes.RECT(10, 10, 30, 30)), \
+        with patch.object(self.popup.locator, "hit", side_effect=lambda **kw: pointer == [15, 15]), \
                 patch("tray_popup.USER.GetCursorPos", side_effect=cursor), \
+                patch("tray_popup.mouse_button_down", return_value=False), \
                 patch("tray_popup.time.monotonic", side_effect=[0, .4, .5, .8, 1.2]), \
                 patch.object(self.root, "after", return_value=None), \
                 patch.object(self.popup, "show", side_effect=show) as showing, \
@@ -128,6 +123,65 @@ class PopupTests(unittest.TestCase):
             self.popup._poll()
             self.assertGreaterEqual(hiding.call_count, 2)
 
+    def test_overflow_hits_only_the_named_tile_without_mouse_notifications(self):
+        locator = self.popup.locator
+        host = 111
+        pointer = [-20, 40]
+        def cursor(target):
+            target._obj.x, target._obj.y = pointer
+            return True
+        def window_class(hwnd, target, length):
+            target.value = "TopLevelWindowForOverflowXamlIsland" if hwnd == 111 else "Shell_TrayWnd"
+            return len(target.value)
+        with patch("tray_locator.USER.GetPhysicalCursorPos", side_effect=cursor), \
+                patch("tray_locator.USER.WindowFromPhysicalPoint", return_value=123), \
+                patch("tray_locator.USER.GetAncestor", side_effect=lambda *args: host), \
+                patch("tray_locator.USER.GetClassNameW", side_effect=window_class):
+            self.assertFalse(locator.hit())
+            locator.result = (host, wintypes.RECT(-30, 30, -10, 50))
+            self.assertTrue(locator.hit())
+            pointer[:] = [-5, 40]  # Adjacent icon in the open panel.
+            self.assertFalse(locator.hit())
+            host = 222  # Panel closed; its previous rectangle is stale.
+            pointer[:] = [-20, 40]
+            self.assertFalse(locator.hit())
+
+    def test_confirmed_hover_survives_obstruction_and_panel_dismissal_until_departure(self):
+        locator = self.popup.locator
+        tile = wintypes.RECT(10, 10, 30, 30)
+        locator.host = 111
+        locator.result = (111, tile)
+        point = [20, 20]
+        def cursor(target):
+            target._obj.x, target._obj.y = point
+            return True
+        def window_class(hwnd, target, length):
+            target.value = "TopLevelWindowForOverflowXamlIsland" if hwnd == 111 else "tooltips_class32"
+            return len(target.value)
+        with patch("tray_locator.USER.GetPhysicalCursorPos", side_effect=cursor), \
+                patch("tray_locator.USER.WindowFromPhysicalPoint", return_value=111), \
+                patch("tray_locator.USER.GetAncestor", return_value=111) as host, \
+                patch("tray_locator.USER.GetClassNameW", side_effect=window_class):
+            self.assertTrue(locator.hit())
+            host.return_value = 222
+            locator.result = (111, None)
+            self.assertTrue(locator.hit(keep_visible=True))
+            self.assertTrue(locator.hit(keep_visible=True))
+            locator.result = (111, wintypes.RECT(0, 0, 0, 0))
+            self.assertTrue(locator.hit(keep_visible=True))
+            point[:] = [50, 50]
+            self.assertFalse(locator.hit(keep_visible=True))
+            point[:] = [20, 20]
+            self.assertFalse(locator.hit())  # An overlay cannot start a hover.
+            host.return_value = 111
+            self.assertFalse(locator.hit())
+            locator.result = (111, tile)
+            self.assertTrue(locator.hit())
+            locator.result = (111, wintypes.RECT(30, 10, 50, 30))
+            self.assertTrue(locator.hit(keep_visible=True))  # Panel animates; cursor stays put.
+            point[:] = [9, 20]
+            self.assertFalse(locator.hit(keep_visible=True))
+
     def test_right_click_suppresses_popup_before_submenu_opens(self):
         with patch("tray_popup.pystray.Icon.__init__", return_value=None):
             icon = HoverIcon("test", None, "", None)
@@ -142,8 +196,8 @@ class PopupTests(unittest.TestCase):
         self.assertGreaterEqual(icon.suppress_until, 11.0)
 
     def test_held_mouse_button_cannot_flash_popup_during_menu_race(self):
-        self.popup.icon = Mock(menu_open=False, suppress_until=0)
-        with patch("tray_popup.icon_rect", return_value=wintypes.RECT(10, 10, 30, 30)), \
+        self.popup.icon = Mock(menu_open=False, suppress_until=0, visible=True)
+        with patch.object(self.popup.locator, "hit", return_value=True), \
                 patch("tray_popup.USER.GetCursorPos"), \
                 patch("tray_popup.mouse_button_down", return_value=True), \
                 patch("tray_popup.time.monotonic", return_value=1.0), \
@@ -155,24 +209,23 @@ class PopupTests(unittest.TestCase):
 
     def test_stale_icon_rect_cannot_start_popup_when_icon_is_not_visible(self):
         self.popup.icon = Mock(menu_open=False, suppress_until=0, visible=False)
-        self.popup.last_icon_rect = wintypes.RECT(10, 10, 30, 30)
-        pointer = wintypes.POINT(15, 15)
-        with patch("tray_popup.icon_rect", return_value=None), \
-                patch("tray_popup.USER.GetCursorPos", side_effect=lambda target: setattr(target._obj, "x", pointer.x) or setattr(target._obj, "y", pointer.y)), \
+        with patch.object(self.popup.locator, "hit", return_value=True) as lookup, \
+                patch("tray_popup.USER.GetCursorPos", return_value=True), \
                 patch("tray_popup.mouse_button_down", return_value=False), \
                 patch("tray_popup.time.monotonic", return_value=1.0), \
                 patch.object(self.root, "after", return_value=None), \
                 patch.object(self.popup, "show") as showing:
             self.popup._poll()
         showing.assert_not_called()
+        lookup.assert_not_called()
 
     def test_menu_close_blocks_rehover_until_pointer_leaves_icon(self):
-        self.popup.icon = Mock(menu_open=False, suppress_until=0, hover_blocked=True)
+        self.popup.icon = Mock(menu_open=False, suppress_until=0, hover_blocked=True, visible=True)
         pointer = [15, 15]
         def cursor(target):
             target._obj.x, target._obj.y = pointer
             return True
-        with patch("tray_popup.icon_rect", return_value=wintypes.RECT(10, 10, 30, 30)), \
+        with patch.object(self.popup.locator, "hit", side_effect=lambda **kw: pointer == [15, 15]), \
                 patch("tray_popup.USER.GetCursorPos", side_effect=cursor), \
                 patch("tray_popup.mouse_button_down", return_value=False), \
                 patch("tray_popup.time.monotonic", return_value=1.0), \
