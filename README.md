@@ -1,11 +1,11 @@
-# SSD Write Monitor 2.1.0
+# SSD Write Monitor 2.1.1
 
 Windows 多固态硬盘写入监控，常驻系统托盘。优先支持 NVMe SSD，包括后续加装的多块固态盘。
 
 ## 直接使用
 
 从 [GitHub Releases](https://github.com/SunZe1/ssd-write-monitor/releases/latest) 下载
-**SSDMonitor-2.1.0-portable.zip**，解压到可写文件夹。
+**SSDMonitor-2.1.1-portable.zip**，解压到可写文件夹。
 退出旧版托盘程序，再双击 **SSDMonitor.exe**。
 本地构建后也可直接运行项目根目录的 exe，便携包位于 dist 目录。
 
